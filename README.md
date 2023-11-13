@@ -17,7 +17,7 @@ The following options are available:
 -url: URL to be scanned.
 -file: File containing URLs to be scanned.
 -proxy: Proxies in the format http://username:password@ip:port.
--prefix: Prefix of result URLs.
+-suffix: Suffix of result URLs.
 -output: Output file for the results (default: subdomain.txt).
 -subdomain: Include subdomains in the scan
 </pre>
