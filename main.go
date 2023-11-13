@@ -41,17 +41,17 @@ func ScanUrl(client *http.Client, url string, subdomain bool, regex *regexp.Rege
 		}
 	}()
 
-	var prefixsub string
+	var suffixsub string
 	var output []string
 	var wrapper [][]string
 
 	if subdomain {
-		prefixsub = "*."
+		suffixsub = "*."
 	} else {
-		prefixsub = ""
+		suffixsub = ""
 	}
 
-	api := fmt.Sprintf("http://web.archive.org/cdx/search/cdx?url=%s%s/*&output=json&collapse=urlkey", prefixsub, url)
+	api := fmt.Sprintf("http://web.archive.org/cdx/search/cdx?url=%s%s/*&output=json&collapse=urlkey", suffixsub, url)
 	resp, err := client.Get(api)
 	handleError(err, fmt.Sprintf("%s error making request", url))
 
@@ -79,7 +79,7 @@ func ScanUrl(client *http.Client, url string, subdomain bool, regex *regexp.Rege
 
 func main() {
 	var urls []string
-	var url, fileInput, proxy, prefix, output string
+	var url, fileInput, proxy, suffix, output string
 	var subdomain bool
 	client := &http.Client{
 		Timeout: 10 * time.Second,
@@ -87,7 +87,7 @@ func main() {
 	flag.StringVar(&url, "url", "", "Url to be scan")
 	flag.StringVar(&fileInput, "file", "", "File urls to be scan")
 	flag.StringVar(&proxy, "proxy", "", "Proxies format http://ip:port")
-	flag.StringVar(&prefix, "prefix", "", "Prefix of results url")
+	flag.StringVar(&suffix, "suffix", "", "suffix of results url")
 	flag.StringVar(&output, "output", "subdomain.txt", "Output of results")
 	flag.BoolVar(&subdomain, "subdomain", false, "Subdomain url to be included")
 
@@ -97,12 +97,12 @@ func main() {
 		os.Exit(1)
 	}
 
-	prefix = strings.ReplaceAll(prefix, ",", "|")
-	prefix = fmt.Sprintf(
+	suffix = strings.ReplaceAll(suffix, ",", "|")
+	suffix = fmt.Sprintf(
 		"(%s)$",
-		prefix,
+		suffix,
 	)
-	regex := regexp.MustCompile(prefix)
+	regex := regexp.MustCompile(suffix)
 	if url != "" {
 		urls = append(urls, filterUrl(url))
 	}
