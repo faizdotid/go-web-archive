@@ -23,7 +23,7 @@ func filterUrl(url string) string {
 			strings.Split(url, "")[:(len(strings.Split(url, ""))-1)], "",
 		)
 	}
-	return url
+	return strings.ReplaceAll(url, "\r", "")
 }
 
 func handleError(err error, msg string) {
