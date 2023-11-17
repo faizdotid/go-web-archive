@@ -51,7 +51,7 @@ func ScanUrl(client *http.Client, url string, subdomain bool, regex *regexp.Rege
 		suffixsub = ""
 	}
 
-	api := fmt.Sprintf("http://web.archive.org/cdx/search/cdx?url=%s%s/*&output=json&collapse=urlkey", suffixsub, url)
+	api := fmt.Sprintf("http://web.archive.org/web/timemap/json?url=%s%s/*&output=json&collapse=urlkey", suffixsub, url)
 	resp, err := client.Get(api)
 	handleError(err, fmt.Sprintf("%s error making request", url))
 
