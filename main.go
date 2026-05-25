@@ -1,12 +1,14 @@
 package main
 
 import (
+	"bufio"
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"net/http"
-	urlparse "net/url"
+	"net/url"
 	"os"
 	"regexp"
 	"strings"
@@ -14,123 +16,229 @@ import (
 	"time"
 )
 
-func filterUrl(url string) string {
-	if strings.Contains(url, "://") {
-		url = strings.Split(url, "/")[2]
+// filterURL extracts the host from a raw URL string and trims trailing slashes.
+func filterURL(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
 	}
-	if strings.HasSuffix(url, "/") {
-		url = strings.Join(
-			strings.Split(url, "")[:(len(strings.Split(url, ""))-1)], "",
-		)
-	}
-	return url
-}
-
-func handleError(err error, msg string) {
-	if err != nil {
-		fmt.Printf("%s: %s\n", msg, err.Error())
-	}
-}
-
-func ScanUrl(client *http.Client, url string, subdomain bool, regex *regexp.Regexp, file *os.File, sem chan bool, wg *sync.WaitGroup) {
-	defer wg.Done()
-	defer func() {
-		<-sem
-		if r := recover(); r != nil {
-			fmt.Println("Recovered in ScanUrl", r)
+	if strings.Contains(raw, "://") {
+		u, err := url.Parse(raw)
+		if err == nil && u.Host != "" {
+			return strings.TrimSuffix(u.Host, "/")
 		}
-	}()
+		// Fallback for malformed URLs.
+		parts := strings.SplitN(raw, "://", 2)
+		if len(parts) == 2 {
+			raw = parts[1]
+		}
+	}
+	return strings.TrimSuffix(raw, "/")
+}
 
-	var suffixsub string
-	var output []string
-	var wrapper [][]string
+type archiveScanner struct {
+	client    *http.Client
+	regex     *regexp.Regexp
+	subdomain bool
+	outMu     sync.Mutex
+	writer    *bufio.Writer
+}
 
-	if subdomain {
-		suffixsub = "*."
-	} else {
-		suffixsub = ""
+func newArchiveScanner(client *http.Client, re *regexp.Regexp, subdomain bool, writer *bufio.Writer) *archiveScanner {
+	return &archiveScanner{
+		client:    client,
+		regex:     re,
+		subdomain: subdomain,
+		writer:    writer,
+	}
+}
+
+func (s *archiveScanner) scanURL(ctx context.Context, target string) (int, error) {
+	var prefix string
+	if s.subdomain {
+		prefix = "*."
 	}
 
-	api := fmt.Sprintf("http://web.archive.org/cdx/search/cdx?url=%s%s/*&output=json&collapse=urlkey", suffixsub, url)
-	resp, err := client.Get(api)
-	handleError(err, fmt.Sprintf("%s error making request", url))
+	apiURL := fmt.Sprintf(
+		"http://web.archive.org/cdx/search/cdx?url=%s%s/*&output=json&collapse=urlkey",
+		prefix, target,
+	)
 
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
+	if err != nil {
+		return 0, fmt.Errorf("build request: %w", err)
+	}
+
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return 0, fmt.Errorf("do request: %w", err)
+	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
-	handleError(err, fmt.Sprintf("%s error reading body", url))
-
-	err = json.Unmarshal(body, &wrapper)
-	handleError(err, fmt.Sprintf("%s error decoding json", url))
-
-	if len(wrapper) == 0 {
-		return
+	if resp.StatusCode != http.StatusOK {
+		return 0, fmt.Errorf("unexpected status: %s", resp.Status)
 	}
 
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return 0, fmt.Errorf("read body: %w", err)
+	}
+
+	var wrapper [][]string
+	if err := json.Unmarshal(body, &wrapper); err != nil {
+		return 0, fmt.Errorf("decode json: %w", err)
+	}
+
+	if len(wrapper) == 0 {
+		return 0, nil
+	}
+
+	var count int
 	for _, wrap := range wrapper[1:] {
-		if regex.Match([]byte(wrap[2])) {
-			output = append(output, wrap[2])
-			file.WriteString(wrap[2] + "\n")
+		if len(wrap) < 3 {
+			continue
+		}
+		link := wrap[2]
+		if s.regex.MatchString(link) {
+			count++
+			s.outMu.Lock()
+			_, _ = fmt.Fprintln(s.writer, link)
+			s.outMu.Unlock()
 		}
 	}
 
-	fmt.Printf("%s => Found %d urls\n", url, len(output))
+	return count, nil
+}
+
+func run(
+	urls []string,
+	suffix string,
+	output string,
+	proxy string,
+	subdomain bool,
+	workers int,
+	timeout time.Duration,
+) error {
+	// Compile regex for URL suffix filtering.
+	suffix = strings.ReplaceAll(suffix, ",", "|")
+	if suffix == "" {
+		suffix = ".*"
+	}
+	pattern := fmt.Sprintf("(%s)$", suffix)
+	re, err := regexp.Compile(pattern)
+	if err != nil {
+		return fmt.Errorf("invalid suffix regex: %w", err)
+	}
+
+	// Configure HTTP client.
+	client := &http.Client{Timeout: timeout}
+	if proxy != "" {
+		proxyURL, err := url.Parse(proxy)
+		if err != nil {
+			return fmt.Errorf("invalid proxy: %w", err)
+		}
+		client.Transport = &http.Transport{Proxy: http.ProxyURL(proxyURL)}
+	}
+
+	// Open output file with buffered writer.
+	f, err := os.OpenFile(output, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o644)
+	if err != nil {
+		return fmt.Errorf("open output file: %w", err)
+	}
+	defer f.Close()
+
+	writer := bufio.NewWriter(f)
+	defer writer.Flush()
+
+	sc := newArchiveScanner(client, re, subdomain, writer)
+	ctx := context.Background()
+
+	jobs := make(chan string, workers)
+	var wg sync.WaitGroup
+
+	// Start worker pool.
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for target := range jobs {
+				if target == "" {
+					continue
+				}
+				count, err := sc.scanURL(ctx, target)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "[-] %s error: %v\n", target, err)
+					continue
+				}
+				fmt.Printf("[+] %s => Found %d urls\n", target, count)
+			}
+		}()
+	}
+
+	// Dispatch jobs.
+	for _, u := range urls {
+		jobs <- u
+	}
+	close(jobs)
+
+	wg.Wait()
+	return nil
 }
 
 func main() {
-	var urls []string
-	var url, fileInput, proxy, suffix, output string
-	var subdomain bool
-	client := &http.Client{
-		Timeout: 10 * time.Second,
-	}
-	flag.StringVar(&url, "url", "", "Url to be scan")
-	flag.StringVar(&fileInput, "file", "", "File urls to be scan")
-	flag.StringVar(&proxy, "proxy", "", "Proxies format http://ip:port")
-	flag.StringVar(&suffix, "suffix", "", "suffix of results url")
-	flag.StringVar(&output, "output", "subdomain.txt", "Output of results")
-	flag.BoolVar(&subdomain, "subdomain", false, "Subdomain url to be included")
+	var (
+		urlStr    string
+		fileInput string
+		proxy     string
+		suffix    string
+		output    string
+		subdomain bool
+		workers   int
+		timeout   time.Duration
+	)
 
+	flag.StringVar(&urlStr, "url", "", "URL to scan")
+	flag.StringVar(&fileInput, "file", "", "File containing URLs to scan")
+	flag.StringVar(&proxy, "proxy", "", "Proxy URL (http://ip:port)")
+	flag.StringVar(&suffix, "suffix", "", "Suffix filter for result URLs (comma separated)")
+	flag.StringVar(&output, "output", "subdomain.txt", "Output file")
+	flag.BoolVar(&subdomain, "subdomain", false, "Include subdomains")
+	flag.IntVar(&workers, "workers", 20, "Number of concurrent workers")
+	flag.DurationVar(&timeout, "timeout", 10*time.Second, "HTTP timeout per request")
 	flag.Parse()
-	if url == "" && fileInput == "" {
+
+	if urlStr == "" && fileInput == "" {
 		flag.PrintDefaults()
 		os.Exit(1)
 	}
 
-	suffix = strings.ReplaceAll(suffix, ",", "|")
-	suffix = fmt.Sprintf(
-		"(%s)$",
-		suffix,
-	)
-	regex := regexp.MustCompile(suffix)
-	if url != "" {
-		urls = append(urls, filterUrl(url))
+	var urls []string
+	if urlStr != "" {
+		urls = append(urls, filterURL(urlStr))
 	}
 
 	if fileInput != "" {
-		file, err := os.ReadFile(fileInput)
-		handleError(err, "file err")
-		for _, url := range strings.Split(string(file), "\n") {
-			urls = append(urls, filterUrl(url))
+		f, err := os.Open(fileInput)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "open file: %v\n", err)
+			os.Exit(1)
+		}
+		defer f.Close()
+
+		scanner := bufio.NewScanner(f)
+		for scanner.Scan() {
+			if u := filterURL(scanner.Text()); u != "" {
+				urls = append(urls, u)
+			}
+		}
+		if err := scanner.Err(); err != nil {
+			fmt.Fprintf(os.Stderr, "read file: %v\n", err)
+			os.Exit(1)
 		}
 	}
-	if proxy != "" {
-		proxyUrl, err := urlparse.Parse(proxy)
-		handleError(err, "error setting proxy")
-		client.Transport = &http.Transport{
-			Proxy: http.ProxyURL(proxyUrl),
-		}
+
+	if err := run(urls, suffix, output, proxy, subdomain, workers, timeout); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
 	}
-	fmt.Printf("Starting scan %d urls\n\n", len(urls))
-	var wg sync.WaitGroup
-	sem := make(chan bool, 20) // limit to 20 concurrent goroutines
-	fileOutput, err := os.OpenFile(output, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0644)
-	handleError(err, "error opening file")
-	defer fileOutput.Close()
-	for _, url := range urls {
-		wg.Add(1)
-		sem <- true
-		go ScanUrl(client, url, subdomain, regex, fileOutput, sem, &wg)
-	}
-	wg.Wait()
 }

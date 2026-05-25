@@ -1,0 +1,14 @@
+# Binaries
+*.exe
+*.out
+*.dll
+*.so
+*.dylib
+
+# Output files
+subdomain.txt
+*.txt
+
+# IDE
+.idea/
+.vscode/
